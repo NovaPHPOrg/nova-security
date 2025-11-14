@@ -1,7 +1,7 @@
 <?php
 declare(strict_types=1);
 
-namespace app\nova\plugin\security;
+namespace nova\plugin\security;
 enum Reason: string
 {
     case BLACKLIST         = 'IP已被封禁';

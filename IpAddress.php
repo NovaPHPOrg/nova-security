@@ -1,135 +1,148 @@
 <?php
 declare(strict_types=1);
 
-namespace app\nova\plugin\security;
+namespace nova\plugin\security;
 
 use InvalidArgumentException;
+use nova\framework\core\Context;
 
 /**
- * Tracks per-IP behaviour, including hits, failures,
- * escalating blacklist penalties and now a confidence score.
+ * IP 行为追踪器 - 60秒滑动窗口
+ *
+ * 用法：
+ *   $ip = IpAddress::load('1.2.3.4');
+ *   $ip->tick(time());
+ *   if ($ip->isBlacklisted($now)) { ... }
+ *   if ($ip->isRateLimited(100)) { ... }
  */
-final class IpAddress
+class IpAddress
 {
-    // ── configuration ─────────────────────────────────────────
-    public const CONFIDENCE_WINDOW    = 300;  // 秒：置信度有效时间窗（默认 5 分钟）
-    public const CONFIDENCE_THRESHOLD = 10;   // 分：超过即视为恶意
+    private const int WINDOW_SECONDS = 60;
+    private const string CACHE_KEY_PREFIX = 'waf:ip:';
 
-    /**
-     * @param string $ip Client IP (IPv4/IPv6)
-     */
-    public function __construct(private readonly string $ip)
+    private array $hits = [];
+    private int $failures = 0;
+    private int $blacklistedTil = 0;
+    private int $maliceCount = 0;
+    private int $lastSeen = 0;
+
+
+    /** 从缓存加载或创建新实例 */
+    public static function load(string $ip): IpAddress
+    {
+        return Context::instance()->getOrCreateInstance($ip, function () use ($ip) {
+            $key = self::CACHE_KEY_PREFIX . $ip;
+            $instance = Context::instance()->cache->get($key);
+            if ($instance instanceof self) {
+                return $instance;
+            }
+
+            return new self($ip);
+        });
+
+    }
+
+    /** 验证 IP 并初始化 */
+    private function __construct(
+        private readonly string $ip
+    )
     {
         if (!filter_var($ip, FILTER_VALIDATE_IP)) {
-            throw new InvalidArgumentException("Invalid IP address: {$ip}");
+            throw new InvalidArgumentException("Invalid IP: {$ip}");
         }
-        $now              = time();
-        $this->lastSeen   = $now;
-        $this->lastFailureTime   = $now;
-        $this->lastConfidenceTime = $now;
+        $this->lastSeen = time();
     }
 
-    // ── runtime state ──────────────────────────────────────────
-    private int $hitsPerMinute        = 0;
-    private int $lastSeen;
-    private int $maliceCount          = 0;
-    private int $blacklistedTil       = 0;
-
-    private int $failedPerMinute      = 0;
-    private int $lastFailureTime;
-
-    // ↳ NEW: confidence tracking
-    private int $confidence           = 0;
-    private int $lastConfidenceTime;
-
-    // ── getters ───────────────────────────────────────────────
-    public function ip(): string              { return $this->ip; }
-    public function blacklistedUntil(): int   { return $this->blacklistedTil; }
-    public function hitsPerMinute(): int      { return $this->hitsPerMinute; }
-    public function failuresPerMinute(): int  { return $this->failedPerMinute; }
-
-    /** 当前置信度（自动检查并可能归零） */
-    public function confidence(int $now = null): int
+    public function ip(): string
     {
-        $now ??= time();
-        $this->expireConfidenceIfNeeded($now);
-        return $this->confidence;
+        return $this->ip;
     }
 
-    /** 置信度 ≥ 阈值即认为恶意 */
-    public function isMalicious(int $now = null): bool
+    /** 是否在黑名单中 */
+    public function isBlacklisted(int $now): bool
     {
-        return $this->confidence($now) >= self::CONFIDENCE_THRESHOLD;
+        return $this->blacklistedTil > $now;
     }
 
-    // ── counters ──────────────────────────────────────────────
-    public function tick(int $now): void
+    /** 是否超过速率限制 */
+    public function isRateLimited(string $uri, int $limit): bool
     {
-        if ($now - $this->lastSeen <= 60) {
-            ++$this->hitsPerMinute;
-        } else {
-            $this->hitsPerMinute = 1;
+        $this->applyTimeWindow(time());
+        return $this->getHits($uri) > $limit;
+    }
+
+    /** 获取指定URI的访问次数 */
+    private function getHits(string $uri): int
+    {
+        return $this->hits[$uri] ?? 0;
+    }
+
+    /** 增加指定URI的访问次数 */
+    private function incrementHits(string $uri): void
+    {
+        if (!isset($this->hits[$uri])) {
+            $this->hits[$uri] = 0;
         }
+        $this->hits[$uri]++;
+    }
+
+    /** 是否失败次数过多 */
+    public function hasExcessiveFailures(int $threshold): bool
+    {
+        $this->applyTimeWindow(time());
+        return $this->failures > $threshold;
+    }
+
+    /** 记录一次请求 */
+    public function tick(string $uri, int $now): void
+    {
+        $this->applyTimeWindow($now);
+        $this->incrementHits($uri);
+        $this->lastSeen = $now;
+        $this->save();
+    }
+
+    /** 记录一次失败 */
+    public function registerFailure(int $now): void
+    {
+        $this->applyTimeWindow($now);
+        $this->failures++;
         $this->lastSeen = $now;
     }
 
-    public function registerFailure(int $now): void
+    /** 拉黑 + 重置，惩罚时间递增 */
+    public function punish(int $now, int $basePenaltySeconds): int
     {
-        if ($now - $this->lastFailureTime <= 60) {
-            ++$this->failedPerMinute;
-        } else {
-            $this->failedPerMinute = 1;
-        }
-        $this->lastFailureTime = $now;
-    }
-
-    /**
-     * ↑ UPDATED
-     * 累加置信度并立即判定是否已达到恶意阈值。
-     *
-     * @param int      $now            当前 Unix 时间戳
-     * @param int      $points         本次要累加的分值（默认 +1）
-     * @param int|null $windowSeconds  自定义窗口；null ⇒ 使用默认 CONFIDENCE_WINDOW
-     *
-     * @return bool  true  ⇒ 当前置信度 ≥ CONFIDENCE_THRESHOLD（视为恶意）
-     *               false ⇒ 尚未达到阈值
-     */
-    public function increaseConfidence(
-        int $now,
-        int $points = 1,
-        ?int $windowSeconds = null
-    ): bool {
-        $this->expireConfidenceIfNeeded(
-            $now,
-            $windowSeconds ?? self::CONFIDENCE_WINDOW
-        );
-
-        $this->confidence       += $points;
-        $this->lastConfidenceTime = $now;
-
-        // 自动判定并返回结果
-        return $this->confidence >= self::CONFIDENCE_THRESHOLD;
-    }
-
-
-    /** Apply punishment & reset other counters. */
-    public function punish(int $now, Reason $reason, int $basePenaltySeconds): int
-    {
+        $this->applyTimeWindow($now);
         $this->maliceCount++;
-        $this->blacklistedTil  = $now + $basePenaltySeconds * $this->maliceCount;
-        $this->hitsPerMinute   = 0;
-        $this->failedPerMinute = 0;
-        $this->confidence      = 0;           // 可选：处罚后清零置信度
+        $this->blacklistedTil = $now + $basePenaltySeconds * $this->maliceCount;
+        $this->failures = 0;
+        $this->hits = [];
+        $this->lastSeen = $now;
+        $this->save();
         return $this->blacklistedTil;
     }
 
-    // ── helpers ───────────────────────────────────────────────
-    private function expireConfidenceIfNeeded(
-        int $now,
-        int $windowSeconds = self::CONFIDENCE_WINDOW
-    ): void {
-        if ($now - $this->lastConfidenceTime > $windowSeconds) {
-            $this->confidence = 0;
+    /** 时间窗口过期则重置计数器 */
+    private function applyTimeWindow(int $now): void
+    {
+        if ($now - $this->lastSeen > self::WINDOW_SECONDS) {
+            $this->hits = [];
+            $this->failures = 0;
+            $this->save();
         }
+    }
+
+
+    private function save()
+    {
+        $key = self::CACHE_KEY_PREFIX . $this->ip;
+        Context::instance()->cache->set($key, $this, 3600);
+    }
+
+    /** 析构时自动保存到缓存 */
+    public function __destruct()
+    {
+        $this->save();
     }
 }

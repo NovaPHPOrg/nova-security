@@ -1,7 +1,7 @@
 <?php
 declare(strict_types=1);
 
-namespace app\nova\plugin\security;
+namespace nova\plugin\security;
 
 use nova\framework\core\Context;
 
